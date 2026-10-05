@@ -8,7 +8,7 @@ import { STORES, getAll, add, put, remove } from '../db.js';
 import {
   el, $, toast, abrirModal, cerrarModal, confirmar, esc,
   dinero, hoyISO, fechaLegible, inicioSemanaISO, inicioMesISO, nombreMes,
-  GASTO_CATEGORIAS
+  METODOS_PAGO, GASTO_CATEGORIAS
 } from '../utils.js';
 import { filtrarPorFecha, gastosPorCategoria } from '../services.js';
 import { exportarExcel, exportarPDF } from '../export.js';
@@ -46,6 +46,13 @@ function formularioGasto(gasto = {}) {
       </div>
     </div>
     <div class="field">
+      <label for="gMetodo">Método de pago *</label>
+      <select id="gMetodo" name="metodoPago" required>
+        <option value="">Selecciona…</option>
+        ${METODOS_PAGO.map(m => `<option ${gasto.metodoPago === m ? 'selected' : ''}>${m}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field">
       <label for="gCategoria">Categoría *</label>
       <select id="gCategoria" name="categoria" required>
         ${GASTO_CATEGORIAS.map((c) => `<option ${gasto.categoria === c ? 'selected' : ''}>${esc(c)}</option>`).join('')}
@@ -65,20 +72,24 @@ function formularioGasto(gasto = {}) {
     e.preventDefault();
     const fd = Object.fromEntries(new FormData(f).entries());
     const monto = Number(fd.monto) || 0;
-    if (monto <= 0) { toast('Ingresa un monto válido', 'error'); return; }
+    if (!Number.isFinite(monto) || monto <= 0) { toast('Ingresa un monto válido', 'error'); return; }
+    const submit = f.querySelector('[type="submit"]');
+    if (submit.disabled) return;
+    submit.disabled = true;
     const registro = {
+      metodoPago: fd.metodoPago,
       categoria: fd.categoria || 'Otros',
       monto: Math.round(monto * 100) / 100,
       fecha: fd.fecha || hoyISO(),
       concepto: (fd.concepto || '').trim()
     };
-    if (esEdit) {
+    try { if (esEdit) {
       await put(STORES.gastos, { ...gasto, ...registro });
       toast('Gasto actualizado', 'success');
     } else {
       await add(STORES.gastos, { ...registro, creadoEn: new Date().toISOString() });
       toast('Gasto registrado', 'success');
-    }
+    } } catch (error) { toast(error.message, 'error'); submit.disabled = false; return; }
     cerrarModal();
     await recargar();
   });

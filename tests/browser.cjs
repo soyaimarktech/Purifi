@@ -1,0 +1,118 @@
+const { chromium } = require('playwright');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const http = require('node:http');
+const path = require('node:path');
+const root = path.resolve(__dirname, '..');
+(async () => {
+  const server = http.createServer((req, res) => {
+    let file = path.resolve(root, '.' + decodeURIComponent(req.url.split('?')[0]));
+    if (file !== root && !file.startsWith(root + path.sep)) { res.writeHead(403).end(); return; }
+    if (file === root) file = path.join(root, 'index.html');
+    fs.readFile(file, (error, data) => {
+      if (error) { res.writeHead(404).end(); return; }
+      res.setHeader('Content-Type', ({ '.js': 'text/javascript', '.css': 'text/css', '.html': 'text/html', '.json': 'application/json', '.png': 'image/png' })[path.extname(file)] || 'application/octet-stream');
+      res.end(data);
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const base = 'http://127.0.0.1:' + server.address().port;
+  let browser;
+  fs.mkdirSync(path.join(root, 'test-results'), { recursive: true });
+  try {
+    browser = await chromium.launch({ headless: true, ...(process.env.BROWSER_CHANNEL ? { channel: process.env.BROWSER_CHANNEL } : {}) });
+    const context = await browser.newContext({ timezoneId: 'America/Mexico_City', viewport: { width: 1280, height: 900 }, serviceWorkers: 'allow' });
+    const page = await context.newPage();
+    const errors = []; page.on('pageerror', e => { errors.push(e.message); console.log('PAGE ERROR', e.message); });
+    page.on('console', m => { if (m.type() === 'error') console.log('CONSOLE', m.text()); });
+    await page.goto(base);
+    await page.evaluate(async () => {
+      const db = await import('/js/db.js');
+      await db.setConfigBulk({ configurado: true, negocio: 'Las Peques · Prueba', respaldoAuto: false });
+      await db.add('clientes', { id: 1, nombre: 'Cliente de prueba', colonia: 'Centro' });
+      const { hoyISO, sumarDiasISO } = await import('/js/utils.js');
+      await db.add('pedidos', { id: 1, clienteId: 1, fecha: sumarDiasISO(hoyISO(), -1), fechaEntrega: sumarDiasISO(hoyISO(), -1), estado: 'Entregado', pagado: false, total: 30, lineas: [{ tamano: '20L', cantidad: 1, precioUnit: 30, canjeCantidad: 0 }] });
+    });
+    await page.goto(base + '/#/pedidos');
+    await page.reload();
+    await page.getByRole('heading', { name: 'Pedidos (1)' }).waitFor();
+    await page.getByRole('button', { name: 'Registrar pago', exact: true }).click();
+    await page.locator('#cMonto').fill('10');
+    await page.locator('#cMetodo').selectOption('Efectivo');
+    await page.locator('#modal').getByRole('button', { name: 'Registrar pago', exact: true }).click();
+    await page.getByText('Entregado · Pago parcial · Debe $20.00', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Registrar pago', exact: true }).click();
+    await page.locator('#cMetodo').selectOption('Transferencia');
+    await page.locator('#modal').getByRole('button', { name: 'Registrar pago', exact: true }).click();
+    await page.getByText('🟢 Entregado · Pagado', { exact: true }).waitFor();
+    await page.getByRole('button', { name: '➕ Nuevo', exact: true }).click();
+    await page.locator('#pCliente').selectOption('1');
+    await page.locator('#pCobro').selectOption('parcial');
+    await page.locator('#pAbono').fill('5');
+    await page.locator('#pMetodo').selectOption('Efectivo');
+    await page.locator('#modal').getByRole('button', { name: 'Registrar', exact: true }).click();
+    await page.getByText('Entregado · Pago parcial · Debe $20.00', { exact: true }).waitFor();
+    await page.goto(base + '/#/gastos');
+    await page.getByRole('button', { name: /Nuevo/, exact: false }).first().click();
+    await page.locator('#gMonto').fill('3');
+    await page.locator('#gMetodo').selectOption('Efectivo');
+    await page.locator('#gConcepto').fill('Gasto de prueba');
+    await page.locator('#modal').getByRole('button', { name: 'Registrar gasto', exact: true }).click();
+    await page.locator('#modal').waitFor({ state: 'hidden' });
+    await page.goto(base + '/#/caja');
+    await page.locator('#caja-fondo').fill('100');
+    await page.locator('#caja-retiros').fill('2');
+    await page.locator('#caja-contado').fill('110');
+    await page.getByText('Efectivo esperado: $110.00 · Diferencia: $0.00 (sin diferencia)', { exact: true }).waitFor();
+    await page.getByRole('button', { name: 'Guardar corte', exact: true }).click();
+    await page.getByRole('button', { name: 'Exportar este corte a Excel', exact: true }).waitFor();
+    const downloadPromise = page.waitForEvent('download');
+    await page.getByRole('button', { name: 'Exportar este corte a Excel', exact: true }).click();
+    const download = await downloadPromise;
+    assert.match(download.suggestedFilename(), /corte.*xlsx$/);
+    const snap = await page.evaluate(async () => {
+      const db = await import('/js/db.js'); return (await db.getAll('config')).find(c => c.clave.startsWith('corte:')).valor;
+    });
+    assert.equal(snap.ventas, 25); assert.equal(snap.cobros, 35); assert.equal(snap.porCobrar, 20); assert.equal(snap.diferencia, 0);
+    await page.waitForFunction(() => !document.querySelector('.toast'));
+    await page.evaluate(() => scrollTo(0, 0));
+    await page.screenshot({ path: path.join(root, 'test-results/caja-desktop.png'), fullPage: true, animations: 'disabled' });
+    await page.setViewportSize({ width: 390, height: 844 });
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    await page.evaluate(() => scrollTo(0, 0));
+    await page.waitForFunction(() => getComputedStyle(document.querySelector('.sidenav')).transform === 'matrix(1, 0, 0, 1, -260, 0)');
+    await page.screenshot({ path: path.join(root, 'test-results/caja-mobile.png'), fullPage: true, animations: 'disabled' });
+    await page.goto(base + '/#/reportes');
+    await page.getByRole('link', { name: 'Consultar cobros y corte de caja' }).waitFor();
+    // Offline reload verifies the service worker includes every new module.
+    await page.evaluate(async () => { await navigator.serviceWorker.ready; });
+    await context.setOffline(true);
+    await page.goto(base + '/#/caja');
+    await page.reload();
+    await page.getByRole('button', { name: 'Exportar este corte a Excel', exact: true }).waitFor();
+    await context.setOffline(false);
+    await page.goto(base + '/#/pedidos');
+    await page.getByRole('button', { name: '➕ Nuevo', exact: true }).click();
+    await page.locator('#pCliente').selectOption('1');
+    await page.locator('#modal').getByRole('button', { name: 'Registrar', exact: true }).click();
+    await page.getByTitle('Marcar entregado', { exact: true }).click();
+    await page.locator('#pCobro').selectOption('pagado');
+    await page.locator('#modal').getByRole('button', { name: 'Guardar', exact: true }).click();
+    await page.locator('#modal').waitFor({ state: 'hidden' });
+    await page.goto(base + '/#/cobranza');
+    await page.getByTitle('Registrar adeudo', { exact: true }).click();
+    await page.locator('#mMonto').fill('5');
+    await page.locator('#modal').getByRole('button', { name: 'Registrar adeudo', exact: true }).click();
+    await page.locator('#modal').waitFor({ state: 'hidden' });
+    await page.getByTitle('Registrar pago', { exact: true }).click();
+    await page.locator('#cMetodo').selectOption('Efectivo');
+    await page.locator('#modal').getByRole('button', { name: 'Registrar pago', exact: true }).click();
+    await page.getByText('Al corriente', { exact: true }).waitFor();
+    await page.getByTitle('Historial', { exact: true }).click();
+    await page.getByTitle('Anular movimiento', { exact: true }).first().click();
+    await page.getByRole('button', { name: 'Anular', exact: true }).click();
+    await page.locator('#modal').waitFor({ state: 'hidden' });
+    assert.deepEqual(errors, []);
+    console.log('PASS browser flow: old debt, two payments, partial delivery, cash expense, cut, XLSX, mobile layout, reports, offline reload.');
+  } finally { await browser?.close(); server.close(); }
+})().catch(e => { console.error(e); process.exitCode = 1; });

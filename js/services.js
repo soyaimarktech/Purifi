@@ -1,19 +1,5 @@
-/**
- * services.js — Lógica de negocio y consultas derivadas.
- * Centraliza cálculos de ventas, saldos y agrupaciones para evitar duplicación.
- *
- * Modelo de cobro (3 estados por pedido):
- *   - Pendiente (en camino)        : estado='Pendiente'           → no es venta ni deuda
- *   - Entregado y pagado           : estado='Entregado', pagado=true  → es venta cobrada
- *   - Entregado a crédito (debe)   : estado='Entregado', pagado=false → es venta + adeudo
- *
- * Saldo (cobranza):
- *   CARGOS  = pedidos entregados NO pagados (total) + adeudos manuales (pagos.tipo='adeudo')
- *   ABONOS  = pagos (pagos.tipo='pago')
- *   SALDO   = CARGOS - ABONOS   (positivo = el cliente debe)
- *
- * Ingresos (ventas): se cuentan cuando el pedido se ENTREGA (no al crearlo).
- */
+/** Ventas por fecha de entrega; cartera calculada a partir de cargos y pagos independientes. */
+import { cartera, generaCargo, fechaVenta } from './finanzas.js';
 import { STORES, getAll, getByIndex } from './db.js';
 import { hoyISO, inicioSemanaISO, inicioMesISO, diasEntre, sumarDiasISO, FRECUENCIA_DIAS, tipoGasto, TAMANOS_GARRAFON, TAMANO_DEFAULT, tamanoPedido, lineasDePedido, cantidadTotalPedido, canjeTotalPedido, resumenLineas } from './utils.js';
 
@@ -45,7 +31,7 @@ export async function rutaSugerida(fechaISO = hoyISO()) {
   const ultima = new Map();
   pedidos.forEach((p) => {
     if (p.estado !== 'Entregado') return;
-    const f = (p.entregadoEn || '').slice(0, 10) || p.fecha;
+    const f = fechaVenta(p);
     if (!f) return;
     const prev = ultima.get(p.clienteId);
     if (!prev || f > prev) ultima.set(p.clienteId, f);
@@ -93,9 +79,9 @@ export async function rutaSugerida(fechaISO = hoyISO()) {
 
 export const CREDITO = 'Crédito (adeudo)';
 
-/** ¿El pedido genera adeudo? Entregado pero no cobrado. */
+/** Cargo de cartera: permanece aunque se liquide, compensado por sus pagos. */
 export function esAdeudoPedido(p) {
-  return p && p.estado === 'Entregado' && p.pagado === false;
+  return p && generaCargo(p);
 }
 
 /** ¿El pedido cuenta como venta? Cuando ya fue entregado. */
@@ -116,40 +102,17 @@ export async function nombreCliente(clienteId, mapa) {
 
 /** Saldo (adeudo) de un cliente. >0 significa que debe. */
 export async function saldoCliente(clienteId) {
-  const [pedidos, pagos] = await Promise.all([
-    getByIndex(STORES.pedidos, 'clienteId', clienteId),
-    getByIndex(STORES.pagos, 'clienteId', clienteId)
-  ]);
-  let cargos = 0;
-  pedidos.forEach((p) => { if (esAdeudoPedido(p)) cargos += Number(p.total) || 0; });
-  let abonos = 0;
-  pagos.forEach((p) => {
-    if (p.tipo === 'adeudo') cargos += Number(p.monto) || 0;
-    else abonos += Number(p.monto) || 0;
-  });
-  return Math.round((cargos - abonos) * 100) / 100;
+  return (await saldosTodos()).get(clienteId) || 0;
 }
-
-/** Saldos de todos los clientes: Map<clienteId, saldo>. */
 export async function saldosTodos() {
-  const [pedidos, pagos] = await Promise.all([
-    getAll(STORES.pedidos), getAll(STORES.pagos)
-  ]);
-  const saldo = new Map();
-  const add = (id, v) => saldo.set(id, (saldo.get(id) || 0) + v);
-  pedidos.forEach((p) => { if (esAdeudoPedido(p)) add(p.clienteId, Number(p.total) || 0); });
-  pagos.forEach((p) => {
-    if (p.tipo === 'adeudo') add(p.clienteId, Number(p.monto) || 0);
-    else add(p.clienteId, -(Number(p.monto) || 0));
-  });
-  for (const [k, v] of saldo) saldo.set(k, Math.round(v * 100) / 100);
-  return saldo;
+  const [pedidos, pagos] = await Promise.all([getAll(STORES.pedidos), getAll(STORES.pagos)]);
+  return cartera(pedidos, pagos).saldos;
 }
 
 /** Ventas (suma de totales de pedidos) dentro de un rango de fechas ISO inclusivo. */
 export function filtrarPorFecha(items, desdeISO, hastaISO) {
   return items.filter((it) => {
-    const f = (it.fecha || '').slice(0, 10);
+    const f = (it.estado === 'Entregado' ? fechaVenta(it) : it.fecha || '').slice(0, 10);
     if (desdeISO && f < desdeISO) return false;
     if (hastaISO && f > hastaISO) return false;
     return true;
@@ -238,7 +201,7 @@ export async function seguimientoClientes() {
   const ultima = new Map();
   pedidos.forEach((p) => {
     if (p.estado !== 'Entregado') return;
-    const f = (p.entregadoEn || '').slice(0, 10) || p.fecha;
+    const f = fechaVenta(p);
     if (!f) return;
     const prev = ultima.get(p.clienteId);
     if (!prev || f > prev) ultima.set(p.clienteId, f);
@@ -291,7 +254,7 @@ export async function analisisComprasClientes() {
   const porCliente = new Map();
   pedidos.forEach((p) => {
     if (p.estado !== 'Entregado') return;
-    const f = (p.entregadoEn || '').slice(0, 10) || p.fecha;
+    const f = fechaVenta(p);
     if (!f) return;
     if (!porCliente.has(p.clienteId)) porCliente.set(p.clienteId, []);
     porCliente.get(p.clienteId).push(f);
@@ -434,7 +397,7 @@ export function garrafonesPorTamano(pedidos) {
 export function ventasPorDia(pedidos, desdeISO, hastaISO) {
   const map = new Map();
   filtrarPorFecha(pedidos, desdeISO, hastaISO).forEach((p) => {
-    const f = (p.fecha || '').slice(0, 10);
+    const f = (fechaVenta(p) || '').slice(0, 10);
     const cur = map.get(f) || { fecha: f, total: 0, garrafones: 0, pedidos: 0 };
     cur.total += Number(p.total) || 0;
     // v2.6: usar cantidadTotalPedido (suma de líneas) en vez de p.cantidad escalar

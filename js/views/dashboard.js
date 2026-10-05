@@ -3,7 +3,8 @@
  */
 import { el, dinero, numero, hoyISO, fechaLegible, diasEntre, CAPACIDAD_DIARIA, TAMANOS_GARRAFON } from '../utils.js';
 import { resumenDashboard, seguimientoClientes, inteligenciaPorGarrafon } from '../services.js';
-import { getConfig } from '../db.js';
+import { resumenCaja } from '../finanzas.js';
+import { STORES, getAll, getConfig } from '../db.js';
 
 function kpi(icono, label, valor, clase) {
   return el('div', { class: `kpi kpi--${clase}` }, [
@@ -15,6 +16,7 @@ function kpi(icono, label, valor, clase) {
 
 export async function render(root) {
   const [r, cfg, seg] = await Promise.all([resumenDashboard(), getConfig(), seguimientoClientes()]);
+  const caja = resumenCaja(...await Promise.all([getAll(STORES.pedidos), getAll(STORES.pagos), getAll(STORES.gastos)]), hoyISO());
   const porVisitar = seg.filter((i) => i.estado === 'por_visitar').length;
   const inactivos = seg.filter((i) => i.estado === 'inactivo').length;
   const bi = await inteligenciaPorGarrafon(30);
@@ -32,9 +34,12 @@ export async function render(root) {
     kpi('💰', 'Ventas del día', dinero(r.ventasDia), 'verde'),
     kpi('📅', 'Ventas de la semana', dinero(r.ventasSemana), 'azul'),
     kpi('👥', 'Clientes activos', numero(r.clientesActivos), 'azul'),
-    kpi('⚠️', 'Adeudos pendientes', dinero(r.adeudoTotal), 'rojo')
+    kpi('💵', 'Cobros del día', dinero(caja.cobros), 'verde'),
+    kpi('⚠️', 'Saldos por cobrar', dinero(r.adeudoTotal), 'rojo')
   ]);
   root.appendChild(grid);
+  root.appendChild(el('a', { href: '#/caja', class: 'btn btn--primary', text: 'Ver corte de caja' }));
+  root.appendChild(el('p', { class: 'hint', text: 'Ventas por fecha de entrega. Cobros por fecha de pago, incluyendo adeudos anteriores.' }));
 
   const grid2 = el('div', { class: 'kpi-grid' }, [
     kpi('🛢️', 'Garrafones vendidos (total)', numero(r.garrafonesTotal), 'naranja'),
