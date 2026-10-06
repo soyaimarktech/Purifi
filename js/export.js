@@ -1,3 +1,4 @@
+import { cartera, fechaVenta } from './finanzas.js';
 /**
  * export.js — Motor de exportación e importación.
  * Formatos: JSON (respaldo completo), CSV, Excel (.xlsx), PDF.
@@ -250,6 +251,7 @@ export async function exportarExcelCompleto() {
     getAll(STORES.gastos), getAll(STORES.mantenimiento), getAll(STORES.inventario)
   ]);
   const mapaCliente = new Map(clientes.map((c) => [c.id, c.nombre]));
+  const cuentas = cartera(pedidos, pagos).porPedido;
 
   exportarExcel(`aquagestion-datos-${hoyISO()}`, [
     {
@@ -267,6 +269,8 @@ export async function exportarExcelCompleto() {
       rows: pedidos.map((p) => ({
         id: p.id,
         fecha: p.fecha,
+        fechaEntrega: p.estado === "Entregado" ? fechaVenta(p) : "",
+        saldoPendiente: cuentas.get(p.id)?.pendiente || 0,
         cliente: mapaCliente.get(p.clienteId) || '—',
         lineas: resumenLineas(p), // v2.6: resumen compacto "3×20L + 2×10L"
         garrafones: cantidadTotalPedido(p),
@@ -279,7 +283,7 @@ export async function exportarExcelCompleto() {
         { key: 'id', label: 'ID' }, { key: 'fecha', label: 'Fecha' },
         { key: 'cliente', label: 'Cliente' }, { key: 'lineas', label: 'Líneas' },
         { key: 'garrafones', label: 'Garrafones totales' },
-        { key: 'total', label: 'Total' },
+        { key: 'total', label: 'Total' }, { key: 'fechaEntrega', label: 'Fecha de entrega' }, { key: 'saldoPendiente', label: 'Saldo pendiente' },
         { key: 'estado', label: 'Estado' }, { key: 'metodoPago', label: 'Método de pago' },
         { key: 'observaciones', label: 'Observaciones' }
       ]
@@ -316,7 +320,7 @@ export async function exportarExcelCompleto() {
       columns: [
         { key: 'id', label: 'ID' }, { key: 'fecha', label: 'Fecha' },
         { key: 'cliente', label: 'Cliente' }, { key: 'tipo', label: 'Tipo' },
-        { key: 'monto', label: 'Monto' }, { key: 'concepto', label: 'Concepto' }
+        { key: 'monto', label: 'Monto' }, { key: 'concepto', label: 'Concepto' }, { key: 'metodoPago', label: 'Método de pago' }, { key: 'pedidoId', label: 'Pedido ID' }, { key: 'anuladoEn', label: 'Anulado en' }
       ]
     },
     {

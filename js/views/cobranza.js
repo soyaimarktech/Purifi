@@ -1,7 +1,10 @@
 /**
  * cobranza.js — Registro de pagos y adeudos, e historial por cliente.
  */
-import { STORES, getAll, add, remove, getByIndex } from '../db.js';
+import { formularioCobro } from './pago.js';
+import { anularMovimiento, registrarAdeudo } from '../libro.js';
+import { fechaVenta } from '../finanzas.js';
+import { STORES, getAll, getByIndex } from '../db.js';
 import {
   el, $, toast, abrirModal, cerrarModal, confirmar, esc, debounce,
   dinero, hoyISO, fechaLegible, tamanoPedido, resumenLineas
@@ -29,6 +32,7 @@ function tarjetaSaldo(c) {
 }
 
 function formPago(cliente, tipo) {
+  if (tipo === 'pago') return formularioCobro({ cliente, saldo: _saldos.get(cliente.id) || 0, alGuardar: recargar });
   const esPago = tipo === 'pago';
   const saldo = _saldos.get(cliente.id) || 0;
   const f = el('form', { class: 'form' });
@@ -59,14 +63,17 @@ function formPago(cliente, tipo) {
     const fd = Object.fromEntries(new FormData(f).entries());
     const monto = Number(fd.monto) || 0;
     if (monto <= 0) { toast('Ingresa un monto válido', 'error'); return; }
-    await add(STORES.pagos, {
+    const submit = f.querySelector('[type="submit"]');
+    if (submit.disabled) return;
+    submit.disabled = true;
+    try { await registrarAdeudo({
       clienteId: cliente.id,
       tipo,
       monto: Math.round(monto * 100) / 100,
       fecha: fd.fecha || hoyISO(),
       concepto: (fd.concepto || '').trim(),
       creadoEn: new Date().toISOString()
-    });
+    }); } catch (error) { toast(error.message, 'error'); submit.disabled = false; return; }
     toast(esPago ? 'Pago registrado' : 'Adeudo registrado', 'success');
     cerrarModal();
     await recargar();
@@ -84,16 +91,16 @@ async function verHistorial(cliente) {
   pedidos.forEach((p) => {
     if (esAdeudoPedido(p)) {
       // v2.6: mostrar resumen de líneas (ej: "3×20L + 2×10L")
-      movimientos.push({ fecha: (p.entregadoEn || '').slice(0, 10) || p.fecha, tipo: 'cargo', etiqueta: `Pedido entregado a crédito (${resumenLineas(p)})`, monto: Number(p.total) || 0 });
+      movimientos.push({ fecha: fechaVenta(p), tipo: 'cargo', etiqueta: `Cargo por pedido entregado (${resumenLineas(p)})`, monto: Number(p.total) || 0 });
     }
   });
   pagos.forEach((p) => {
     movimientos.push({
       fecha: p.fecha,
       tipo: p.tipo === 'pago' ? 'abono' : 'cargo',
-      etiqueta: (p.tipo === 'pago' ? 'Pago' : 'Adeudo') + (p.concepto ? ` — ${p.concepto}` : ''),
+      etiqueta: (p.anuladoEn ? 'ANULADO · ' : '') + (p.tipo === 'pago' ? `Pago · ${p.metodoPago || 'Método sin registrar'}` : 'Adeudo') + (p.concepto ? ` — ${p.concepto}` : ''),
       monto: Number(p.monto) || 0,
-      pagoId: p.id
+      pagoId: p.anuladoEn ? null : p.id
     });
   });
   movimientos.sort((a, b) => (b.fecha || '').localeCompare(a.fecha || ''));
@@ -125,11 +132,11 @@ async function verHistorial(cliente) {
         ]),
         el('div', { class: 'flex' }, [
           el('span', { class: `badge ${esAbono ? 'badge--pago' : 'badge--adeudo'}`, text: `${esAbono ? '-' : '+'}${dinero(m.monto)}` }),
-          m.pagoId ? el('button', { class: 'icon-btn icon-btn--danger', title: 'Eliminar', text: '🗑️', onclick: async () => {
-            const ok = await confirmar('¿Eliminar este movimiento?', { ok: 'Eliminar', peligro: true });
+          m.pagoId ? el('button', { class: 'icon-btn icon-btn--danger', title: 'Anular movimiento', text: '🗑️', onclick: async () => {
+            const ok = await confirmar('¿Anular este movimiento? Se conservará el registro y se recalculará el saldo.', { ok: 'Anular', peligro: true });
             if (!ok) return;
-            await remove(STORES.pagos, m.pagoId);
-            toast('Movimiento eliminado', 'success');
+            try { await anularMovimiento(m.pagoId); } catch (error) { toast(error.message, 'error'); return; }
+            toast('Movimiento anulado', 'success');
             cerrarModal();
             await recargar();
           } }) : null
@@ -182,7 +189,7 @@ export async function render(root) {
   [_clientes, _saldos] = await Promise.all([getAll(STORES.clientes), saldosTodos()]);
 
   root.innerHTML = '';
-  root.appendChild(el('div', { class: 'page-head' }, [ el('h2', { text: 'Cobranza' }) ]));
+  root.appendChild(el('div', { class: 'page-head' }, [ el('h2', { text: 'Cobranza' }), el('a', { href: '#/caja', class: 'btn btn--primary', text: 'Corte de caja' }) ]));
   root.appendChild(el('div', { class: 'card', id: 'resumenCobranza', style: 'background:var(--naranja-claro)' }));
 
   const toolbar = el('div', { class: 'toolbar' }, [

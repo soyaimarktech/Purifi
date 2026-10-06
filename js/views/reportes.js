@@ -1,6 +1,7 @@
 /**
  * reportes.js — Reportes de ventas y cobranza con exportación a Excel y PDF.
  */
+import { cartera, fechaVenta } from '../finanzas.js';
 import { STORES, getAll } from '../db.js';
 import {
   el, $, dinero, numero, hoyISO, fechaLegible, inicioSemanaISO, inicioMesISO,
@@ -15,6 +16,7 @@ import {
 import { exportarExcel, exportarPDF, exportarCSV } from '../export.js';
 
 let _pedidos = [];
+let _saldosPedido = new Map();
 let _gastos = [];
 let _periodo = 'semana';
 let _datos = null; // resultado calculado actual
@@ -145,7 +147,7 @@ function tarjetaBalance(d) {
         el('strong', { text: dinero(d.utilidad) })
       ])
     ]),
-    el('p', { class: 'muted', style: 'margin:8px 0 0', text: d.gastosPeriodo === 0 ? 'Aún no hay gastos registrados en el periodo. Registra los gastos para conocer la utilidad real.' : (positivo ? 'El negocio es rentable en este periodo. 🎉' : 'Los gastos superan a las ventas en este periodo.') })
+    el('p', { class: 'muted', style: 'margin:8px 0 0', text: d.gastosPeriodo === 0 ? 'Aún no hay gastos registrados en el periodo. Este balance compara ventas y gastos, no entradas de caja.' : (positivo ? 'Diferencia entre ventas y gastos; no equivale al efectivo disponible.' : 'Los gastos superan a las ventas en este periodo.') })
   ]);
 }
 
@@ -167,7 +169,8 @@ function expExcel() {
       nombre: 'Pedidos detallados',
       rows: d.enRango.flatMap((p) => lineasDePedido(p).map((l, idx) => ({
         PedidoId: p.id,
-        Fecha: p.fecha,
+        FechaEntrega: fechaVenta(p),
+        FechaPedido: p.fecha,
         Linea: idx + 1,
         Tamano: l.tamano || '20L',
         Cantidad: l.cantidad,
@@ -176,7 +179,8 @@ function expExcel() {
         Canje: l.canjeCantidad || 0,
         TotalPedido: p.total,
         Estado: p.estado,
-        Pagado: p.pagado ? 'Sí' : 'No'
+        Pagado: (_saldosPedido.get(p.id)?.pendiente || 0) === 0 ? 'Sí' : 'No',
+        SaldoPendiente: _saldosPedido.get(p.id)?.pendiente || 0
       }))),
     },
     {
@@ -349,8 +353,10 @@ async function pintar(root) {
 
 export async function render(root) {
   [_pedidos, _gastos] = await Promise.all([getAll(STORES.pedidos), getAll(STORES.gastos)]);
+  _saldosPedido = cartera(_pedidos, await getAll(STORES.pagos)).porPedido;
 
   root.innerHTML = '';
+  root.appendChild(el('a', { href: '#/caja', class: 'btn btn--primary', text: 'Consultar cobros y corte de caja' }));
   root.appendChild(el('div', { class: 'page-head' }, [ el('h2', { text: 'Reportes' }) ]));
 
   // Selector de periodo

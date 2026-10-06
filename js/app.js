@@ -16,6 +16,7 @@ import { getConfig, setConfigBulk } from './db.js';
 import { setMoneda, $, $$, toast, el, esc, abrirModal, cerrarModal, TAMANOS_GARRAFON, PRECIOS_DEFAULT_POR_TAMANO, PRECIOS_CANJE_DEFAULT_POR_TAMANO } from './utils.js';
 import { respaldoAutomatico } from './export.js';
 
+import * as caja from './views/caja.js';
 import * as dashboard from './views/dashboard.js';
 import * as clientes from './views/clientes.js';
 import * as pedidos from './views/pedidos.js';
@@ -29,6 +30,7 @@ import * as reportes from './views/reportes.js';
 import * as configuracion from './views/configuracion.js';
 
 const ROUTES = {
+  caja: { title: 'Corte de caja', mod: caja },
   dashboard: { title: 'Dashboard', mod: dashboard },
   clientes: { title: 'Clientes', mod: clientes },
   pedidos: { title: 'Pedidos', mod: pedidos },

@@ -290,6 +290,30 @@ function reqWithTx(request, transaction) {
 
 /* ---------- API genérico CRUD ---------- */
 
+// Lee y escribe dentro de la misma transacción para evitar cobros duplicados
+// entre pestañas. El callback es síncrono; las escrituras usan stores nativos.
+export async function transaccionFinanciera(fn) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const names = ['pedidos', 'pagos', 'gastos', 'config', 'inventario'];
+    const tx = db.transaction(names, 'readwrite');
+    const stores = Object.fromEntries(names.map(n => [n, tx.objectStore(n)]));
+    const datos = {}; let restantes = names.length; let resultado; let error;
+    tx.oncomplete = () => { notificarCambio(); resolve(resultado); };
+    tx.onabort = () => reject(error || tx.error || new Error('No se guardó el movimiento.'));
+    tx.onerror = () => {};
+    names.forEach(n => {
+      const req = stores[n].getAll();
+      req.onsuccess = () => {
+        datos[n] = req.result;
+        if (--restantes) return;
+        try { fn(datos, stores, valor => { resultado = valor; }, e => { error = e; tx.abort(); }); }
+        catch (e) { error = e; tx.abort(); }
+      };
+    });
+  });
+}
+
 export async function getAll(storeName) {
   const { store } = await openTx(storeName);
   return reqToPromise(store.getAll());

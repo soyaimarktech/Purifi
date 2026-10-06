@@ -13,18 +13,22 @@
  * Al guardar, siempre se usa el formato nuevo (array lineas). Los pedidos
  * legacy no se modifican en disco a menos que se editen.
  */
-import { STORES, getAll, add, put, remove, getByIndex, getConfig } from '../db.js';
+import { STORES, getAll, getConfig } from '../db.js';
 import {
   el, $, toast, abrirModal, cerrarModal, confirmar, esc, debounce,
   dinero, numero, hoyISO, fechaLegible, METODOS_PAGO, ESTADOS_PEDIDO, folioCliente,
   TAMANOS_GARRAFON, TAMANO_DEFAULT, tamanoPedido, lineasDePedido, cantidadTotalPedido, canjeTotalPedido, resumenLineas
 } from '../utils.js';
+import { cartera } from '../finanzas.js';
+import { guardarPedido, eliminarPendiente } from '../libro.js';
+import { formularioCobro } from './pago.js';
 import { mapaClientes } from '../services.js';
 
 let _pedidos = [];
 let _clientes = [];
 let _mapa = new Map();
 let _cfg = {};
+let _cuentas = new Map();
 
 function estadoCobroVal(p) {
   if (!p || p.estado !== 'Entregado') return 'pendiente';
@@ -34,7 +38,8 @@ function estadoCobroVal(p) {
 /** Insignia que refleja los 3 estados: pendiente / entregado y pagado / entregado a crédito. */
 function estadoCobroBadge(p) {
   if (p.estado !== 'Entregado') return el('span', { class: 'badge badge--pend', text: '🟠 Pendiente' });
-  if (p.pagado === false) return el('span', { class: 'badge badge--adeudo', text: '🔴 Entregado · A crédito' });
+  const cuenta = _cuentas.get(p.id);
+  if (cuenta?.pendiente > 0) return el('span', { class: 'badge badge--adeudo', text: `Entregado · ${cuenta.abonado > 0 ? 'Pago parcial' : 'Por cobrar'} · Debe ${dinero(cuenta.pendiente)}` });
   return el('span', { class: 'badge badge--entreg', text: '🟢 Entregado · Pagado' });
 }
 
@@ -60,83 +65,20 @@ function tarjetaPedido(p) {
       onclick: () => marcarEntregado(p)
     }));
   }
-  actions.appendChild(el('button', { class: 'icon-btn', title: 'Editar', text: '✏️', onclick: () => formularioPedido(p) }));
-  actions.appendChild(el('button', { class: 'icon-btn icon-btn--danger', title: 'Eliminar', text: '🗑️', onclick: () => eliminarPedido(p) }));
+  if (p.estado === 'Entregado' && (_cuentas.get(p.id)?.pendiente || 0) > 0) actions.appendChild(el('button', { class: 'btn btn--success', text: 'Registrar pago', onclick: () => formularioCobro({ cliente: cli, pedidoId: p.id, saldo: _cuentas.get(p.id).pendiente, alGuardar: recargar }) }));
+  if (p.estado !== 'Entregado') actions.appendChild(el('button', { class: 'icon-btn', title: 'Editar', text: '✏️', onclick: () => formularioPedido(p) }));
+  if (p.estado !== 'Entregado') actions.appendChild(el('button', { class: 'icon-btn icon-btn--danger', title: 'Eliminar', text: '🗑️', onclick: () => eliminarPedido(p) }));
   return el('div', { class: 'item' }, [main, actions]);
 }
 
 function marcarEntregado(p) {
-  const cli = _mapa.get(p.clienteId);
-  const resumen = resumenLineas(p);
-  const cont = el('div', {}, [
-    el('p', { class: 'confirm__msg', html: `Entrega para <strong>${esc(cli ? cli.nombre : 'cliente')}</strong> · ${esc(resumen)}<br>Total: <strong>${dinero(p.total)}</strong>` }),
-    el('p', { class: 'muted', text: '¿Se cobró este pedido al momento de entregar?' }),
-    el('div', { class: 'confirm__actions', style: 'flex-direction:column;gap:10px' }, [
-      el('button', { class: 'btn btn--success btn--lg', html: `💵 Sí, pagó (${dinero(p.total)})`, onclick: () => confirmarEntrega(p, true) }),
-      el('button', { class: 'btn btn--warn btn--lg', text: '🔴 No, quedó a crédito (debe)', onclick: () => confirmarEntrega(p, false) }),
-      el('button', { class: 'btn btn--ghost btn--lg', text: 'Cancelar', onclick: cerrarModal })
-    ])
-  ]);
-  abrirModal('Confirmar entrega', cont);
-}
-
-async function confirmarEntrega(p, pagado) {
-  p.estado = 'Entregado';
-  p.pagado = pagado;
-  p.entregadoEn = new Date().toISOString();
-  await put(STORES.pedidos, p);
-  await sincronizarCanje(p);
-  cerrarModal();
-  toast(pagado ? 'Entregado y cobrado ✔' : 'Entregado — se registró el adeudo en Cobranza', pagado ? 'success' : 'warn');
-  await recargar();
+  formularioPedido({ ...p, _entregar: true });
 }
 
 async function eliminarPedido(p) {
-  const ok = await confirmar('¿Eliminar este pedido?', { ok: 'Eliminar', peligro: true });
-  if (!ok) return;
-  await remove(STORES.pedidos, p.id);
-  const movs = await getByIndex(STORES.inventario, 'pedidoId', p.id);
-  await Promise.all(movs.map((m) => remove(STORES.inventario, m.id)));
-  toast('Pedido eliminado', 'success');
-  await recargar();
-}
-
-/**
- * Sincroniza los movimientos de inventario por canje ligados a un pedido.
- * v2.6: ahora itera las líneas del pedido. Cada línea con canjeCantidad > 0
- * genera un movimiento de inventario independiente para su tamaño.
- */
-async function sincronizarCanje(pedido) {
-  if (!pedido || pedido.id == null) return;
-  const previos = await getByIndex(STORES.inventario, 'pedidoId', pedido.id);
-  await Promise.all(previos.map((m) => remove(STORES.inventario, m.id)));
-
-  if (pedido.estado !== 'Entregado') return;
-
-  const lineas = lineasDePedido(pedido);
-  for (const linea of lineas) {
-    const qty = Math.max(0, Math.floor(Number(linea.canjeCantidad) || 0));
-    if (qty <= 0) continue;
-    const tam = linea.tamano || tamanoPedido(pedido);
-    const nuevosPorTamano = { '20L': 0, '19L': 0, '12L': 0, '10L': 0 };
-    const usadosPorTamano = { '20L': 0, '19L': 0, '12L': 0, '10L': 0 };
-    nuevosPorTamano[tam] = -qty;
-    usadosPorTamano[tam] = qty;
-    await add(STORES.inventario, {
-      fecha: (pedido.entregadoEn || '').slice(0, 10) || pedido.fecha || hoyISO(),
-      tipo: 'Canje',
-      tamano: tam,
-      cantidad: qty,
-      nuevos: -qty,
-      usados: qty,
-      nuevosPorTamano,
-      usadosPorTamano,
-      concepto: `Canje de garrafón ${tam} (pedido entregado)`,
-      pedidoId: pedido.id,
-      clienteId: pedido.clienteId,
-      creadoEn: new Date().toISOString()
-    });
-  }
+  if (!await confirmar('¿Eliminar este pedido pendiente?', { ok: 'Eliminar', peligro: true })) return;
+  try { await eliminarPendiente(p.id); toast('Pedido eliminado', 'success'); await recargar(); }
+  catch (error) { toast(error.message, 'error'); }
 }
 
 /* ===========================================================
@@ -302,7 +244,7 @@ function formularioPedido(pedido = {}) {
   }
   const f = el('form', { class: 'form' });
   _formRef = f;
-  const cobroActual = estadoCobroVal(pedido);
+  const cobroActual = pedido._entregar ? 'credito' : estadoCobroVal(pedido);
 
   // Inicializar líneas: si es edición, cargar las existentes; si no, una línea vacía
   _lineasActuales = lineasDePedido(pedido).map((l) => crearLinea(l));
@@ -318,7 +260,7 @@ function formularioPedido(pedido = {}) {
     </div>
     <div class="field--row">
       <div class="field">
-        <label for="pFecha">Fecha *</label>
+        <label for="pFecha">Fecha del pedido *</label>
         <input id="pFecha" name="fecha" type="date" required value="${esc(pedido.fecha || hoyISO())}" />
       </div>
     </div>
@@ -334,6 +276,7 @@ function formularioPedido(pedido = {}) {
         <select id="pCobro" name="cobro">
           <option value="pendiente" ${cobroActual === 'pendiente' ? 'selected' : ''}>🟠 Pendiente (en camino)</option>
           <option value="pagado" ${cobroActual === 'pagado' ? 'selected' : ''}>🟢 Entregado y pagado</option>
+          <option value="parcial">🟡 Entregado con pago parcial</option>
           <option value="credito" ${cobroActual === 'credito' ? 'selected' : ''}>🔴 Entregado a crédito (debe)</option>
         </select>
       </div>
@@ -344,6 +287,11 @@ function formularioPedido(pedido = {}) {
         </select>
       </div>
     </div>
+    <div class="field" id="pAbonoField" hidden>
+      <label for="pAbono">Abono recibido hoy</label>
+      <input id="pAbono" name="abono" type="number" min="0.01" step="0.01" />
+    </div>
+    <p class="hint">La entrega y el cobro se registran con la fecha de hoy. La fecha del pedido se conserva.</p>
     <div class="field">
       <label for="pObs">Observaciones</label>
       <textarea id="pObs" name="observaciones" placeholder="Notas del pedido">${esc(pedido.observaciones || '')}</textarea>
@@ -358,6 +306,13 @@ function formularioPedido(pedido = {}) {
     </div>
   `;
 
+  const actualizarCobro = () => {
+    const parcial = f.querySelector('#pCobro').value === 'parcial';
+    f.querySelector('#pAbonoField').hidden = !parcial;
+    f.querySelector('#pAbono').required = parcial;
+  };
+  f.querySelector('#pCobro').addEventListener('change', actualizarCobro);
+  actualizarCobro();
   // Renderizar las líneas iniciales
   const lineasCont = f.querySelector('#pLineas');
   _lineasActuales.forEach((l) => renderLinea(l, lineasCont));
@@ -397,7 +352,7 @@ function formularioPedido(pedido = {}) {
     let estado = 'Pendiente';
     let pagado = false;
     if (cobro === 'pagado') { estado = 'Entregado'; pagado = true; }
-    else if (cobro === 'credito') { estado = 'Entregado'; pagado = false; }
+    else if (cobro === 'credito' || cobro === 'parcial') { estado = 'Entregado'; pagado = false; }
 
     // Calcular total final
     const preciosCanjePorTamano = _cfg.preciosCanjePorTamano || {};
@@ -429,17 +384,16 @@ function formularioPedido(pedido = {}) {
     registro.canjeCantidad = lineas.reduce((s, l) => s + l.canjeCantidad, 0);
     registro.precioCanje = preciosCanjePorTamano[primera.tamano] ?? 0;
 
-    if (esEdit) {
-      await put(STORES.pedidos, registro);
-      await sincronizarCanje(registro);
-      toast('Pedido actualizado', 'success');
-    } else {
-      registro.creadoEn = new Date().toISOString();
-      const nuevoId = await add(STORES.pedidos, registro);
-      registro.id = nuevoId;
-      await sincronizarCanje(registro);
-      toast('Pedido registrado', 'success');
-    }
+    const cobrado = cobro === 'pagado' ? total : cobro === 'parcial' ? Number(fd.abono) : 0;
+    if (cobro === 'parcial' && (!Number.isFinite(cobrado) || cobrado <= 0 || cobrado >= total)) { toast('El abono debe ser mayor a cero y menor al total.', 'error'); return; }
+    const submit = f.querySelector('[type="submit"]');
+    if (submit.disabled) return;
+    submit.disabled = true;
+    try {
+      delete registro._entregar;
+      await guardarPedido(registro, cobrado);
+      toast(esEdit ? 'Pedido actualizado' : 'Pedido registrado', 'success');
+    } catch (error) { toast(error.message, 'error'); submit.disabled = false; return; }
     _formRef = null;
     _lineasActuales = [];
     cerrarModal();
@@ -484,12 +438,14 @@ function aplicarFiltros() {
 async function recargar() {
   [_pedidos, _clientes] = await Promise.all([getAll(STORES.pedidos), getAll(STORES.clientes)]);
   _mapa = await mapaClientes();
+  _cuentas = cartera(_pedidos, await getAll(STORES.pagos)).porPedido;
   aplicarFiltros();
 }
 
 export async function render(root, params = []) {
   [_pedidos, _clientes, _cfg] = await Promise.all([getAll(STORES.pedidos), getAll(STORES.clientes), getConfig()]);
   _mapa = new Map(_clientes.map((c) => [c.id, c]));
+  _cuentas = cartera(_pedidos, await getAll(STORES.pagos)).porPedido;
 
   root.innerHTML = '';
   root.appendChild(el('div', { class: 'page-head' }, [

@@ -11,3 +11,6 @@ Thumbs.db
 
 # Dependencias (no se usan; todo es vanilla)
 node_modules/
+
+# Capturas de pruebas de navegador
+test-results/
